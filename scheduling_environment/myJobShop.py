@@ -1,12 +1,13 @@
 import numpy as np
 from typing import Dict, List
+import time
 
 from Job_Shop_Scheduling_Benchmark_Environments_and_Instances.scheduling_environment.job import Job
 from Job_Shop_Scheduling_Benchmark_Environments_and_Instances.scheduling_environment.machine import Machine
 from Job_Shop_Scheduling_Benchmark_Environments_and_Instances.scheduling_environment.operation import Operation
 
 
-class JobShop:
+class MyJobShop:
     def __init__(self) -> None:
         self._nr_of_jobs = 0
         self._nr_of_machines = 0
@@ -19,7 +20,10 @@ class JobShop:
         self._operations_to_be_scheduled: List[Operation] = []
         self._operations_available_for_scheduling: List[Operation] = []
         self._scheduled_operations: List[Operation] = []
+        self._assigned_operations: List[Operation] = []
         self._instance_name: str = ""
+        self._now = 0
+        self._scheduled_operation_indics = {}
 
     def __repr__(self):
         return (
@@ -30,6 +34,10 @@ class JobShop:
 
     def reset(self):
         self._scheduled_operations = []
+        self._assigned_operations: List[Operation] = []
+        self._now = 0
+        for i, operation in enumerate(self._operations):
+            self._scheduled_operation_indics[operation.operation_id] = 0
 
         self._operations_to_be_scheduled = [
             operation for operation in self._operations]
@@ -39,8 +47,8 @@ class JobShop:
 
         for operation in self._operations:
             operation.reset()
-
-        self.update_operations_available_for_scheduling()
+        #Check norl mode or fast mode
+        self.update_operations_available_for_scheduling_fast()
 
     def set_instance_name(self, name: str) -> None:
         """Set the name of the instance."""
@@ -141,6 +149,11 @@ class JobShop:
         return self._operations_available_for_scheduling
 
     @property
+    def assigned_operations(self) -> List[Operation]:
+        """Return all the operations that are assigned"""
+        return self._assigned_operations
+
+    @property
     def scheduled_operations(self) -> List[Operation]:
         """Return all the operations that are scheduled"""
         return self._scheduled_operations
@@ -212,6 +225,58 @@ class JobShop:
         machine.add_operation_to_schedule(operation, duration, self._sequence_dependent_setup_times)
         self.mark_operation_as_scheduled(operation)
 
+    def add_operation_to_machine(self, operation: Operation, machine_id, duration) -> None:
+        machine = self.get_machine(machine_id)
+        machine.add_operation(operation, duration)
+        self.assigned_operations.append(operation)
+    
+    
+
+    def schedule_operation_on_machine_step(self) -> None:
+        """Schedule an operation on a specific machine."""
+        start_time = time.time()
+        machine_state = []
+        for machine in self.machines:
+            st = time.time()
+            operation_state = machine.process_current_operation(self._now)
+            machine_state.append(operation_state)
+            print(f"single machine processing Time taken: {time.time() - st} seconds")
+        print(f"processing Time taken: {time.time() - start_time} seconds")
+
+        start_time = time.time()
+        for operation_state in machine_state:
+            if operation_state is not None:
+                start_time = time.time()
+                self.mark_operation_as_scheduled(operation_state)
+        print(f"marking operation as scheduled Time taken: {time.time() - start_time} seconds")
+        self._now += 1
+        return machine_state
+
+    def schedule_operation_on_machine_step_fast(self) -> None:
+        """Schedule an operation on a specific machine."""
+        
+        machine_state = []
+        # fast_time_taken = 0
+        if len(self.get_available_machines(self._now))==self.nr_of_machines:
+            # All machines are available
+            fast_time_taken = 0
+        else:
+            fast_time_taken = min([(machine._current_operation[0][1] - machine._current_operation[0][2]) for machine in self.machines if len(machine._current_operation) > 0])
+
+        for machine in self.machines:
+            operation_state = machine.process_current_operation_fast(self._now, fast_time_taken)
+            machine_state.append(operation_state)
+
+
+        for operation_state in machine_state:
+            if operation_state is not None:
+                self.mark_operation_as_scheduled(operation_state)
+        self._now += fast_time_taken
+        return machine_state, fast_time_taken
+
+    def get_available_machines(self, _now):
+        return [machine for machine in self.machines if machine.available]
+
     def schedule_operation_with_backfilling(self, operation: Operation, machine_id, duration) -> None:
         """Schedule an operation"""
         if operation not in self.operations_available_for_scheduling:
@@ -234,7 +299,9 @@ class JobShop:
         """Mark an operation as scheduled."""
         self.scheduled_operations.append(operation)
         self.operations_to_be_scheduled.remove(operation)
-
+        self.assigned_operations.remove(operation)
+        self._scheduled_operation_indics[operation.operation_id] = 1
+        operation.set_scheduled()
     def mark_operation_as_available(self, operation: Operation) -> None:
         """Mark an operation as available for scheduling."""
         if operation not in self.scheduled_operations:
@@ -242,16 +309,57 @@ class JobShop:
                 f"Operation {operation.operation_id} is not scheduled")
         self.scheduled_operations.remove(operation)
         self.operations_to_be_scheduled.append(operation)
-
+        self.assigned_operations.remove(operation)
+        self._scheduled_operation_indics[operation.operation_id] = 0
+        operation.set_unscheduled()
+        
     def update_operations_available_for_scheduling(self) -> None:
         """Update the list of operations available for scheduling."""
         scheduled_operations = set(self.scheduled_operations)
+
         operations_available_for_scheduling = [
             operation
             for operation in self.operations
             if operation not in scheduled_operations and all(
                 prec_operation in scheduled_operations
                 for prec_operation in self._precedence_relations_operations[operation.operation_id]
-            )
+            ) and any(self.get_machine(machine_id).available for machine_id in operation.processing_times.keys())
         ]
+
+        operations_available_for_scheduling = [operation for operation in operations_available_for_scheduling 
+                                        if operation not in self.assigned_operations]
+        
         self._operations_available_for_scheduling = operations_available_for_scheduling
+    
+    def update_operations_available_for_scheduling_fast(self) -> None:
+        """Update the list of operations available for scheduling."""
+        # Convert to set for O(1) lookups
+        assigned_ops_set = self.assigned_operations
+        
+        # Pre-calculate machine availability
+        available_machines = {machine.machine_id: machine.available for machine in self._machines}
+        operations_available = []
+        # Single pass through candidates
+
+        for operation in self.operations:
+            # Skip if already scheduled or assigned
+            if (self._scheduled_operation_indics[operation.operation_id] == 1 or 
+                operation in assigned_ops_set):
+                continue
+                
+            # Check precedence relations - using set operations
+            if not operation._prec_satisfied:
+                
+                check_prec_list = [self._scheduled_operation_indics[prec_op.operation_id] == 1 for prec_op in self._precedence_relations_operations[operation.operation_id]]
+                if not all(check_prec_list):
+                    continue
+                else:
+                    operation._prec_satisfied = True
+                
+            # Check if any required machine is available - using pre-calculated dict
+            if not any(available_machines[m_id] for m_id in operation.processing_times):
+                continue
+                
+            operations_available.append(operation)
+
+        self._operations_available_for_scheduling = operations_available
